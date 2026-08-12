@@ -244,17 +244,19 @@ export async function getPageByHandle(handle: string): Promise<BackendPage | nul
   return data.pages.nodes[0] ?? null;
 }
 
+type CollectionsPage = {
+  collections: {
+    pageInfo: {hasNextPage: boolean; endCursor: string | null};
+    nodes: BackendCollection[];
+  };
+};
+
 export async function getAllCollections(): Promise<BackendCollection[]> {
   const all: BackendCollection[] = [];
   let after: string | null = null;
 
   do {
-    const data = await adminFetch<{
-      collections: {
-        pageInfo: {hasNextPage: boolean; endCursor: string | null};
-        nodes: BackendCollection[];
-      };
-    }>(COLLECTIONS_QUERY, {first: 50, after});
+    const data: CollectionsPage = await adminFetch<CollectionsPage>(COLLECTIONS_QUERY, {first: 50, after});
 
     all.push(...data.collections.nodes);
     after = data.collections.pageInfo.hasNextPage
@@ -265,17 +267,19 @@ export async function getAllCollections(): Promise<BackendCollection[]> {
   return all;
 }
 
+type ProductsPage = {
+  products: {
+    pageInfo: {hasNextPage: boolean; endCursor: string | null};
+    nodes: Parameters<typeof mapProduct>[0][];
+  };
+};
+
 export async function getAllProducts(): Promise<BackendProduct[]> {
   const all: BackendProduct[] = [];
   let after: string | null = null;
 
   do {
-    const data = await adminFetch<{
-      products: {
-        pageInfo: {hasNextPage: boolean; endCursor: string | null};
-        nodes: Parameters<typeof mapProduct>[0][];
-      };
-    }>(PRODUCTS_QUERY, {first: 50, after});
+    const data: ProductsPage = await adminFetch<ProductsPage>(PRODUCTS_QUERY, {first: 50, after});
 
     all.push(...data.products.nodes.map(mapProduct));
     after = data.products.pageInfo.hasNextPage
