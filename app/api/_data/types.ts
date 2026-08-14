@@ -32,6 +32,10 @@ export type BackendPage = {
   title: string;
   handle: string;
   body: string;
+  seo: {
+    title: string | null;
+    description: string | null;
+  };
 };
 
 export type BackendCollection = {
@@ -53,6 +57,10 @@ export type BackendProduct = {
   vendor: string;
   description: string;
   descriptionHtml: string;
+  seo: {
+    title: string | null;
+    description: string | null;
+  };
   featuredImage: {
     url: string;
     altText: string | null;

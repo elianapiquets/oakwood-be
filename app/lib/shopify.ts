@@ -7,6 +7,7 @@ const PRODUCT_FIELDS = `
   vendor
   description
   descriptionHtml
+  seo { title description }
   featuredImage { url altText width height }
   options { name values }
   variants(first: 20) {
@@ -127,6 +128,7 @@ type RawProduct = {
   vendor: string;
   description: string;
   descriptionHtml: string;
+  seo: {title: string | null; description: string | null};
   featuredImage: {url: string; altText: string | null; width: number | null; height: number | null} | null;
   options: Array<{name: string; values: string[]}>;
   variants: {nodes: RawVariant[]};
@@ -152,6 +154,7 @@ function mapProduct(raw: RawProduct): BackendProduct {
     vendor: raw.vendor,
     description: raw.description ?? '',
     descriptionHtml: raw.descriptionHtml ?? '',
+    seo: raw.seo ?? {title: null, description: null},
     featuredImage: raw.featuredImage ?? null,
     options: raw.options ?? [],
     variants: raw.variants.nodes.map(mapVariant),
@@ -236,7 +239,7 @@ export async function getPageByHandle(handle: string): Promise<BackendPage | nul
   }>(`
     query PageByHandle($query: String!) {
       pages(first: 1, query: $query) {
-        nodes { id title handle body }
+        nodes { id title handle body seo { title description } }
       }
     }
   `, {query: `handle:${handle}`});
@@ -336,4 +339,13 @@ export async function getProductsByHandles(
     handles.map((h) => getProductByHandle(h).catch(() => null)),
   );
   return results.filter((p): p is BackendProduct => p !== null);
+}
+
+export type BackendCompany = {id: string; name: string};
+
+export async function getAllCompanies(): Promise<BackendCompany[]> {
+  const data = await adminFetch<{
+    companies: {nodes: BackendCompany[]};
+  }>(`{ companies(first: 50) { nodes { id name } } }`);
+  return data.companies.nodes;
 }
