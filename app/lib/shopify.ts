@@ -349,3 +349,105 @@ export async function getAllCompanies(): Promise<BackendCompany[]> {
   }>(`{ companies(first: 50) { nodes { id name } } }`);
   return data.companies.nodes;
 }
+
+/**
+ * Billing details for a B2B company location, for the storefront's
+ * /account/company/[id] page. Lives here because the Customer Account API — the
+ * only API the storefront can call as a logged-in customer — doesn't expose
+ * any of it: its `buyerExperienceConfiguration` carries only `deposit` and
+ * `payNowOnly`, and it has no tax-settings field at all.
+ *
+ * Payment methods are deliberately absent. Introspecting this store's live
+ * Admin schema shows `CompanyLocation` has 29 fields and none of them return
+ * stored payment methods or instruments (the only payment-adjacent ones are
+ * `storeCreditAccounts` and `taxSettings`). Shopify's own hosted account UI
+ * does render a "Payment methods" section, so it reads them through a private
+ * internal endpoint rather than any public API. The field is returned as an
+ * empty array so the storefront contract stays stable if a path turns up.
+ */
+export type CompanyLocationBilling = {
+  paymentTerms: {
+    name: string;
+    dueInDays: number | null;
+    description: string | null;
+    type: string | null;
+  } | null;
+  paymentMethods: Array<{id: string; label: string; detail: string | null}>;
+  tax: {
+    taxId: string | null;
+    taxExempt: boolean | null;
+  };
+};
+
+const COMPANY_LOCATION_BILLING_QUERY = `
+  query CompanyLocationBilling($id: ID!) {
+    companyLocation(id: $id) {
+      id
+      name
+      buyerExperienceConfiguration {
+        paymentTermsTemplate {
+          name
+          description
+          dueInDays
+          paymentTermsType
+        }
+      }
+      taxSettings {
+        taxExempt
+        taxRegistrationId
+      }
+    }
+  }
+`;
+
+/**
+ * `locationId` accepts either the numeric id the storefront puts in its URL or
+ * a full `gid://shopify/CompanyLocation/...`.
+ */
+export async function getCompanyLocationBilling(
+  locationId: string,
+): Promise<CompanyLocationBilling | null> {
+  const id = locationId.startsWith('gid://')
+    ? locationId
+    : `gid://shopify/CompanyLocation/${locationId}`;
+
+  const data = await adminFetch<{
+    companyLocation: {
+      id: string;
+      name: string;
+      buyerExperienceConfiguration: {
+        paymentTermsTemplate: {
+          name: string | null;
+          description: string | null;
+          dueInDays: number | null;
+          paymentTermsType: string | null;
+        } | null;
+      } | null;
+      taxSettings: {
+        taxExempt: boolean | null;
+        taxRegistrationId: string | null;
+      } | null;
+    } | null;
+  }>(COMPANY_LOCATION_BILLING_QUERY, {id});
+
+  const location = data.companyLocation;
+  if (!location) return null;
+
+  const template = location.buyerExperienceConfiguration?.paymentTermsTemplate;
+
+  return {
+    paymentTerms: template?.name
+      ? {
+          name: template.name,
+          dueInDays: template.dueInDays ?? null,
+          description: template.description ?? null,
+          type: template.paymentTermsType ?? null,
+        }
+      : null,
+    paymentMethods: [],
+    tax: {
+      taxId: location.taxSettings?.taxRegistrationId ?? null,
+      taxExempt: location.taxSettings?.taxExempt ?? null,
+    },
+  };
+}
