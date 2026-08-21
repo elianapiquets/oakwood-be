@@ -697,3 +697,73 @@ export async function createCompanyLocation(
 
   return {ok: true, location: payload.companyLocation};
 }
+
+
+/* ------------------------------------------------------------------ *
+ * Company locations — address assignment
+ * ------------------------------------------------------------------ */
+
+export type CompanyAddressType = 'BILLING' | 'SHIPPING';
+
+const COMPANY_LOCATION_ASSIGN_ADDRESS_MUTATION = `
+  mutation CompanyLocationAssignAddress(
+    $locationId: ID!
+    $address: CompanyAddressInput!
+    $addressTypes: [CompanyAddressType!]!
+  ) {
+    companyLocationAssignAddress(
+      locationId: $locationId
+      address: $address
+      addressTypes: $addressTypes
+    ) {
+      addresses {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+export type AssignCompanyAddressResult =
+  | {ok: true}
+  | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
+
+/**
+ * Sets a location's shipping and/or billing address.
+ *
+ * This is the only way to change one: `CompanyLocationUpdateInput` has no
+ * address fields at all (verified by introspection at 2025-07), so
+ * `companyLocationUpdate` can't do it. Passing both types is how "same as
+ * shipping" is expressed after creation.
+ *
+ * `locationId` accepts either the numeric id or a full gid.
+ */
+export async function assignCompanyLocationAddress(
+  locationId: string,
+  address: CompanyAddressInput,
+  addressTypes: CompanyAddressType[],
+): Promise<AssignCompanyAddressResult> {
+  const id = locationId.startsWith('gid://')
+    ? locationId
+    : `gid://shopify/CompanyLocation/${locationId}`;
+
+  const data = await adminFetch<{
+    companyLocationAssignAddress: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_LOCATION_ASSIGN_ADDRESS_MUTATION,
+    {locationId: id, address, addressTypes},
+    {mutation: true},
+  );
+
+  const userErrors =
+    data.companyLocationAssignAddress?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
+
+  return {ok: true};
+}
