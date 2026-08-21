@@ -52,6 +52,12 @@ function getEnv() {
 async function adminFetch<T>(
   query: string,
   variables: Record<string, unknown> = {},
+  /**
+   * Mutations must not be cached. Queries keep the 60s revalidate; a mutation
+   * with `next: {revalidate}` risks Next serving a cached response for what is
+   * supposed to be a write.
+   */
+  {mutation = false}: {mutation?: boolean} = {},
 ): Promise<T> {
   const {domain, token} = getEnv();
   const res = await fetch(
@@ -63,7 +69,7 @@ async function adminFetch<T>(
         'X-Shopify-Access-Token': token,
       },
       body: JSON.stringify({query, variables}),
-      next: {revalidate: 60},
+      ...(mutation ? {cache: 'no-store' as const} : {next: {revalidate: 60}}),
     },
   );
 
@@ -450,4 +456,244 @@ export async function getCompanyLocationBilling(
       taxExempt: location.taxSettings?.taxExempt ?? null,
     },
   };
+}
+
+/* ------------------------------------------------------------------ *
+ * Company locations — creation
+ * ------------------------------------------------------------------ */
+
+export type PaymentTermsTemplate = {
+  id: string;
+  name: string;
+  dueInDays: number | null;
+  paymentTermsType: string | null;
+};
+
+const PAYMENT_TERMS_TEMPLATES_QUERY = `
+  query PaymentTermsTemplates {
+    paymentTermsTemplates {
+      id
+      name
+      dueInDays
+      paymentTermsType
+    }
+  }
+`;
+
+/**
+ * The real templates, because `companyLocationCreate` needs a
+ * `PaymentTermsTemplate` gid — these can't be hardcoded from a screenshot.
+ *
+ * `FIXED` is filtered out: it represents "due on a specific date" and is
+ * meaningless without an accompanying date, which a plain dropdown can't
+ * supply. Shopify's own company-location form omits it for the same reason.
+ * Everything else is passed through, including `RECEIPT` ("Due on receipt"),
+ * which the admin form happens not to list but which is perfectly valid.
+ */
+export async function getPaymentTermsTemplates(): Promise<
+  PaymentTermsTemplate[]
+> {
+  const data = await adminFetch<{
+    paymentTermsTemplates: PaymentTermsTemplate[];
+  }>(PAYMENT_TERMS_TEMPLATES_QUERY);
+
+  return (data.paymentTermsTemplates ?? []).filter(
+    (template) => template.paymentTermsType !== 'FIXED',
+  );
+}
+
+export type CompanyAddressInput = {
+  address1?: string;
+  address2?: string;
+  city?: string;
+  zoneCode?: string;
+  zip?: string;
+  /** A `CountryCode` enum value, e.g. 'US'. */
+  countryCode?: string;
+  recipient?: string;
+  phone?: string;
+};
+
+export type CreateCompanyLocationInput = {
+  name: string;
+  externalId?: string;
+  /**
+   * Optional on `CompanyLocationInput`, but the mutation rejects a location
+   * without one: `userErrors: [{field: ['input','shippingAddress']}]`.
+   */
+  shippingAddress?: CompanyAddressInput;
+  /** Ignored by Shopify when `billingSameAsShipping` is true. */
+  billingAddress?: CompanyAddressInput;
+  taxRegistrationId?: string;
+  taxExempt?: boolean;
+  billingSameAsShipping?: boolean;
+  buyerExperienceConfiguration?: {
+    paymentTermsTemplateId?: string;
+    checkoutToDraft?: boolean;
+    editableShippingAddress?: boolean;
+  };
+};
+
+const COMPANY_CONTACT_ROLES_QUERY = `
+  query CompanyContactRoles($companyId: ID!) {
+    company(id: $companyId) {
+      contactRoles(first: 10) {
+        nodes {
+          id
+          name
+        }
+      }
+    }
+  }
+`;
+
+const COMPANY_CONTACT_ASSIGN_ROLE_MUTATION = `
+  mutation CompanyContactAssignRole(
+    $companyContactId: ID!
+    $companyContactRoleId: ID!
+    $companyLocationId: ID!
+  ) {
+    companyContactAssignRole(
+      companyContactId: $companyContactId
+      companyContactRoleId: $companyContactRoleId
+      companyLocationId: $companyLocationId
+    ) {
+      companyContactRoleAssignment {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/** The role a location's creator is given. */
+const CREATOR_ROLE_NAME = 'Location admin';
+
+/**
+ * Grants a company contact a role at a location.
+ *
+ * A freshly created location has no contacts, and the storefront's own
+ * authorization check reads the signed-in customer's `companyContacts.locations`
+ * — so without this the creator gets a 404 on the location they just made, and
+ * it never appears in their locations list either.
+ */
+async function assignContactToLocation(
+  companyId: string,
+  companyContactId: string,
+  companyLocationId: string,
+): Promise<{ok: true} | {ok: false; message: string}> {
+  const roles = await adminFetch<{
+    company: {contactRoles: {nodes: Array<{id: string; name: string}>}} | null;
+  }>(COMPANY_CONTACT_ROLES_QUERY, {companyId});
+
+  const available = roles.company?.contactRoles?.nodes ?? [];
+  const role =
+    available.find((candidate) => candidate.name === CREATOR_ROLE_NAME) ??
+    available[0];
+
+  if (!role) {
+    return {ok: false, message: 'The company has no contact roles to assign'};
+  }
+
+  const assigned = await adminFetch<{
+    companyContactAssignRole: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_CONTACT_ASSIGN_ROLE_MUTATION,
+    {companyContactId, companyContactRoleId: role.id, companyLocationId},
+    {mutation: true},
+  );
+
+  const userErrors = assigned.companyContactAssignRole?.userErrors ?? [];
+
+  if (userErrors.length) {
+    return {ok: false, message: userErrors[0].message};
+  }
+
+  return {ok: true};
+}
+
+export type CreateCompanyLocationResult =
+  | {ok: true; location: {id: string; name: string}}
+  | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
+
+const COMPANY_LOCATION_CREATE_MUTATION = `
+  mutation CompanyLocationCreate($companyId: ID!, $input: CompanyLocationInput!) {
+    companyLocationCreate(companyId: $companyId, input: $input) {
+      companyLocation {
+        id
+        name
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * `companyId` accepts either the numeric id or a full gid.
+ *
+ * Note there is no market to set: `CompanyLocationInput` has no market field,
+ * and this store's only market targets the US *region* rather than a list of
+ * locations, so a new US location joins it automatically.
+ */
+export async function createCompanyLocation(
+  companyId: string,
+  input: CreateCompanyLocationInput,
+  /**
+   * Contact to grant `Location admin` at the new location. Without it the
+   * location is invisible to the customer who created it — see
+   * `assignContactToLocation`.
+   */
+  assignContactId?: string,
+): Promise<CreateCompanyLocationResult> {
+  const id = companyId.startsWith('gid://')
+    ? companyId
+    : `gid://shopify/Company/${companyId}`;
+
+  const data = await adminFetch<{
+    companyLocationCreate: {
+      companyLocation: {id: string; name: string} | null;
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(COMPANY_LOCATION_CREATE_MUTATION, {companyId: id, input}, {mutation: true});
+
+  const payload = data.companyLocationCreate;
+
+  // `userErrors` is how Shopify reports a rejected name or a duplicate
+  // externalId. It arrives with a 200 and an empty `errors`, so adminFetch
+  // can't see it — the caller has to.
+  if (payload?.userErrors?.length || !payload?.companyLocation) {
+    return {ok: false, userErrors: payload?.userErrors ?? []};
+  }
+
+  if (assignContactId) {
+    const assignment = await assignContactToLocation(
+      id,
+      assignContactId,
+      payload.companyLocation.id,
+    );
+
+    // The location exists at this point, so this is reported rather than
+    // swallowed: an unassigned location is one its creator can't open.
+    if (!assignment.ok) {
+      return {
+        ok: false,
+        userErrors: [
+          {
+            field: null,
+            message: `Location created, but the contact could not be assigned to it: ${assignment.message}`,
+          },
+        ],
+      };
+    }
+  }
+
+  return {ok: true, location: payload.companyLocation};
 }
