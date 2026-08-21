@@ -1,4 +1,3 @@
-import {revalidateTag} from 'next/cache';
 import type {BackendCollection, BackendPage, BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
 
 const PRODUCT_FIELDS = `
@@ -50,22 +49,20 @@ function getEnv() {
   return {domain, token};
 }
 
-/**
- * Cache tag for everything read about one company location.
+/*
+ * Invalidate-after-write was tried here and does not work in this setup, so
+ * don't reach for it again without re-testing:
  *
- * Reads of a location's settings keep the 60s Data Cache, and the mutations
- * below drop this tag afterwards — otherwise a save lands in Shopify while the
- * page keeps showing the previous value for up to a minute, which reads as a
- * save that silently failed.
+ * Tagging the read and calling `revalidateTag(tag, {expire: 0})` from the
+ * mutation left the endpoint still serving the old value — Shopify held
+ * `taxExempt: true` while the read returned `false`. Next 16 changed
+ * `revalidateTag` to *set an expiry profile* rather than purge, and the
+ * immediate equivalent, `updateTag`, is Server-Action-only — these are Route
+ * Handlers.
+ *
+ * So mutable per-location reads pass `noCache` instead. It costs one Admin call
+ * per page view (query cost 2 against a 20,000 bucket) and is always correct.
  */
-function companyLocationTag(id: string): string {
-  return `company-location:${id.split('/').pop()}`;
-}
-
-/** Drops the cached reads for one location. Call after any write to it. */
-function revalidateCompanyLocation(id: string): void {
-  revalidateTag(companyLocationTag(id));
-}
 
 async function adminFetch<T>(
   query: string,
@@ -80,11 +77,7 @@ async function adminFetch<T>(
    * mutation changes it. Catalogue data can tolerate that; a company location's
    * settings cannot.
    */
-  {
-    mutation = false,
-    noCache = false,
-    tags,
-  }: {mutation?: boolean; noCache?: boolean; tags?: string[]} = {},
+  {mutation = false, noCache = false}: {mutation?: boolean; noCache?: boolean} = {},
 ): Promise<T> {
   const {domain, token} = getEnv();
   const res = await fetch(
@@ -98,7 +91,7 @@ async function adminFetch<T>(
       body: JSON.stringify({query, variables}),
       ...(mutation || noCache
         ? {cache: 'no-store' as const}
-        : {next: {revalidate: 60, ...(tags ? {tags} : {})}}),
+        : {next: {revalidate: 60}}),
     },
   );
 
@@ -402,6 +395,8 @@ export async function getAllCompanies(): Promise<BackendCompany[]> {
  */
 export type CompanyLocationBilling = {
   paymentTerms: {
+    /** The `PaymentTermsTemplate` gid, so the edit form can preselect it. */
+    id: string;
     name: string;
     dueInDays: number | null;
     description: string | null;
@@ -412,6 +407,14 @@ export type CompanyLocationBilling = {
     taxId: string | null;
     taxExempt: boolean | null;
   };
+  /**
+   * The rest of `buyerExperienceConfiguration`. Returned so a payment-terms
+   * update can send it back unchanged — see `updateCompanyLocationPaymentTerms`.
+   */
+  checkout: {
+    checkoutToDraft: boolean | null;
+    editableShippingAddress: boolean | null;
+  };
 };
 
 const COMPANY_LOCATION_BILLING_QUERY = `
@@ -420,7 +423,10 @@ const COMPANY_LOCATION_BILLING_QUERY = `
       id
       name
       buyerExperienceConfiguration {
+        checkoutToDraft
+        editableShippingAddress
         paymentTermsTemplate {
+          id
           name
           description
           dueInDays
@@ -451,7 +457,10 @@ export async function getCompanyLocationBilling(
       id: string;
       name: string;
       buyerExperienceConfiguration: {
+        checkoutToDraft: boolean | null;
+        editableShippingAddress: boolean | null;
         paymentTermsTemplate: {
+          id: string;
           name: string | null;
           description: string | null;
           dueInDays: number | null;
@@ -463,16 +472,21 @@ export async function getCompanyLocationBilling(
         taxRegistrationId: string | null;
       } | null;
     } | null;
-  }>(COMPANY_LOCATION_BILLING_QUERY, {id}, {tags: [companyLocationTag(id)]});
+    // Not cached: read straight after a mutation changes it, and a stale
+    // `taxExempt` reads as a save that silently failed.
+  }>(COMPANY_LOCATION_BILLING_QUERY, {id}, {noCache: true});
 
   const location = data.companyLocation;
   if (!location) return null;
 
   const template = location.buyerExperienceConfiguration?.paymentTermsTemplate;
 
+  const checkout = location.buyerExperienceConfiguration;
+
   return {
     paymentTerms: template?.name
       ? {
+          id: template.id,
           name: template.name,
           dueInDays: template.dueInDays ?? null,
           description: template.description ?? null,
@@ -483,6 +497,10 @@ export async function getCompanyLocationBilling(
     tax: {
       taxId: location.taxSettings?.taxRegistrationId ?? null,
       taxExempt: location.taxSettings?.taxExempt ?? null,
+    },
+    checkout: {
+      checkoutToDraft: checkout?.checkoutToDraft ?? null,
+      editableShippingAddress: checkout?.editableShippingAddress ?? null,
     },
   };
 }
@@ -794,8 +812,6 @@ export async function assignCompanyLocationAddress(
 
   if (userErrors.length) return {ok: false, userErrors};
 
-  revalidateCompanyLocation(id);
-
   return {ok: true};
 }
 
@@ -867,7 +883,85 @@ export async function updateCompanyLocationTaxSettings(
 
   if (userErrors.length) return {ok: false, userErrors};
 
-  revalidateCompanyLocation(id);
+  return {ok: true};
+}
+
+
+/* ------------------------------------------------------------------ *
+ * Company locations — payment terms
+ * ------------------------------------------------------------------ */
+
+const COMPANY_LOCATION_UPDATE_MUTATION = `
+  mutation CompanyLocationUpdate(
+    $companyLocationId: ID!
+    $input: CompanyLocationUpdateInput!
+  ) {
+    companyLocationUpdate(
+      companyLocationId: $companyLocationId
+      input: $input
+    ) {
+      companyLocation {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * Sets a location's payment terms template.
+ *
+ * Unlike tax and addresses, this one *is* on `CompanyLocationUpdateInput`, under
+ * `buyerExperienceConfiguration`. The catch: that object also carries
+ * `checkoutToDraft` and `editableShippingAddress`, and it isn't documented
+ * whether a partial object merges or replaces. So the current values are read
+ * first and sent back alongside — clobbering a location's checkout settings as
+ * a side effect of changing its payment terms would be a nasty surprise.
+ *
+ * `templateId: null` means "no payment terms".
+ */
+export async function updateCompanyLocationPaymentTerms(
+  locationId: string,
+  templateId: string | null,
+  /** Current checkout flags, preserved. Omit and they're left untouched. */
+  checkout?: {
+    checkoutToDraft?: boolean | null;
+    editableShippingAddress?: boolean | null;
+  },
+): Promise<AssignCompanyAddressResult> {
+  const id = locationId.startsWith('gid://')
+    ? locationId
+    : `gid://shopify/CompanyLocation/${locationId}`;
+
+  const data = await adminFetch<{
+    companyLocationUpdate: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_LOCATION_UPDATE_MUTATION,
+    {
+      companyLocationId: id,
+      input: {
+        buyerExperienceConfiguration: {
+          paymentTermsTemplateId: templateId,
+          ...(typeof checkout?.checkoutToDraft === 'boolean'
+            ? {checkoutToDraft: checkout.checkoutToDraft}
+            : {}),
+          ...(typeof checkout?.editableShippingAddress === 'boolean'
+            ? {editableShippingAddress: checkout.editableShippingAddress}
+            : {}),
+        },
+      },
+    },
+    {mutation: true},
+  );
+
+  const userErrors = data.companyLocationUpdate?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
 
   return {ok: true};
 }
