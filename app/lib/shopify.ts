@@ -1,3 +1,4 @@
+import {revalidateTag} from 'next/cache';
 import type {BackendCollection, BackendPage, BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
 
 const PRODUCT_FIELDS = `
@@ -49,15 +50,41 @@ function getEnv() {
   return {domain, token};
 }
 
+/**
+ * Cache tag for everything read about one company location.
+ *
+ * Reads of a location's settings keep the 60s Data Cache, and the mutations
+ * below drop this tag afterwards — otherwise a save lands in Shopify while the
+ * page keeps showing the previous value for up to a minute, which reads as a
+ * save that silently failed.
+ */
+function companyLocationTag(id: string): string {
+  return `company-location:${id.split('/').pop()}`;
+}
+
+/** Drops the cached reads for one location. Call after any write to it. */
+function revalidateCompanyLocation(id: string): void {
+  revalidateTag(companyLocationTag(id));
+}
+
 async function adminFetch<T>(
   query: string,
   variables: Record<string, unknown> = {},
   /**
-   * Mutations must not be cached. Queries keep the 60s revalidate; a mutation
-   * with `next: {revalidate}` risks Next serving a cached response for what is
-   * supposed to be a write.
+   * `mutation` — writes must never be cached; `next: {revalidate}` on one risks
+   * Next serving a cached response for what is supposed to be a write.
+   *
+   * `noCache` — for reads whose value changes and is per-customer. The 60s
+   * revalidate below is an explicit opt-in to Next's Data Cache, so a read left
+   * on the default keeps returning a stale value for up to a minute after a
+   * mutation changes it. Catalogue data can tolerate that; a company location's
+   * settings cannot.
    */
-  {mutation = false}: {mutation?: boolean} = {},
+  {
+    mutation = false,
+    noCache = false,
+    tags,
+  }: {mutation?: boolean; noCache?: boolean; tags?: string[]} = {},
 ): Promise<T> {
   const {domain, token} = getEnv();
   const res = await fetch(
@@ -69,7 +96,9 @@ async function adminFetch<T>(
         'X-Shopify-Access-Token': token,
       },
       body: JSON.stringify({query, variables}),
-      ...(mutation ? {cache: 'no-store' as const} : {next: {revalidate: 60}}),
+      ...(mutation || noCache
+        ? {cache: 'no-store' as const}
+        : {next: {revalidate: 60, ...(tags ? {tags} : {})}}),
     },
   );
 
@@ -434,7 +463,7 @@ export async function getCompanyLocationBilling(
         taxRegistrationId: string | null;
       } | null;
     } | null;
-  }>(COMPANY_LOCATION_BILLING_QUERY, {id});
+  }>(COMPANY_LOCATION_BILLING_QUERY, {id}, {tags: [companyLocationTag(id)]});
 
   const location = data.companyLocation;
   if (!location) return null;
@@ -764,6 +793,81 @@ export async function assignCompanyLocationAddress(
     data.companyLocationAssignAddress?.userErrors ?? [];
 
   if (userErrors.length) return {ok: false, userErrors};
+
+  revalidateCompanyLocation(id);
+
+  return {ok: true};
+}
+
+
+/* ------------------------------------------------------------------ *
+ * Company locations — tax settings
+ * ------------------------------------------------------------------ */
+
+const COMPANY_LOCATION_TAX_SETTINGS_MUTATION = `
+  mutation CompanyLocationTaxSettingsUpdate(
+    $companyLocationId: ID!
+    $taxRegistrationId: String
+    $taxExempt: Boolean
+  ) {
+    companyLocationTaxSettingsUpdate(
+      companyLocationId: $companyLocationId
+      taxRegistrationId: $taxRegistrationId
+      taxExempt: $taxExempt
+    ) {
+      companyLocation {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+export type UpdateTaxSettingsResult =
+  | {ok: true}
+  | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
+
+/**
+ * Sets a location's tax registration id and tax-exempt flag.
+ *
+ * `companyLocationUpdate` can't do this — `CompanyLocationUpdateInput` carries
+ * no tax fields (verified by introspection at 2025-07). This dedicated mutation
+ * is the route, and it handles both values in one call.
+ *
+ * `taxRegistrationId: null` clears the id; the exemption list is left alone,
+ * since nothing collects one yet.
+ */
+export async function updateCompanyLocationTaxSettings(
+  locationId: string,
+  settings: {taxRegistrationId?: string | null; taxExempt?: boolean},
+): Promise<UpdateTaxSettingsResult> {
+  const id = locationId.startsWith('gid://')
+    ? locationId
+    : `gid://shopify/CompanyLocation/${locationId}`;
+
+  const data = await adminFetch<{
+    companyLocationTaxSettingsUpdate: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_LOCATION_TAX_SETTINGS_MUTATION,
+    {
+      companyLocationId: id,
+      taxRegistrationId: settings.taxRegistrationId ?? null,
+      taxExempt: settings.taxExempt,
+    },
+    {mutation: true},
+  );
+
+  const userErrors =
+    data.companyLocationTaxSettingsUpdate?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
+
+  revalidateCompanyLocation(id);
 
   return {ok: true};
 }
