@@ -1,4 +1,4 @@
-import type {BackendCollection, BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
+import type {BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
 
 const PRODUCT_FIELDS = `
   id
@@ -188,48 +188,6 @@ function mapProduct(raw: RawProduct): BackendProduct {
     variants: raw.variants.nodes.map(mapVariant),
     chemistry: mapChemistry(raw.metafields.nodes),
   };
-}
-
-const COLLECTIONS_QUERY = `
-  query Collections($first: Int!, $after: String) {
-    collections(first: $first, after: $after) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id
-        title
-        handle
-        image {
-          url
-          altText
-          width
-          height
-        }
-      }
-    }
-  }
-`;
-
-type CollectionsPage = {
-  collections: {
-    pageInfo: {hasNextPage: boolean; endCursor: string | null};
-    nodes: BackendCollection[];
-  };
-};
-
-export async function getAllCollections(): Promise<BackendCollection[]> {
-  const all: BackendCollection[] = [];
-  let after: string | null = null;
-
-  do {
-    const data: CollectionsPage = await adminFetch<CollectionsPage>(COLLECTIONS_QUERY, {first: 50, after});
-
-    all.push(...data.collections.nodes);
-    after = data.collections.pageInfo.hasNextPage
-      ? data.collections.pageInfo.endCursor
-      : null;
-  } while (after);
-
-  return all;
 }
 
 type ProductsPage = {
