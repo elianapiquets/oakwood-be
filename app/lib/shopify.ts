@@ -1260,3 +1260,300 @@ export async function createCompanyContact(
 
   return {ok: true, contactId};
 }
+
+/* ------------------------------------------------------------------ *
+ * Companies — self-serve creation
+ * ------------------------------------------------------------------ */
+
+/**
+ * Our own approval flag — Shopify has no native pending state for companies.
+ *
+ * A **boolean**, backed by a metafield definition created in the admin: the
+ * definition is what makes it visible there *and* what grants the Customer
+ * Account API read access. Without one the value exists but the storefront
+ * reads `null`, which the gate can't distinguish from "not set".
+ *
+ * `false` blocks editing; `true` or absent allows it. Absent has to mean
+ * approved so companies predating self-serve signup aren't locked out.
+ */
+export const APPROVAL_METAFIELD = {
+  namespace: 'custom',
+  key: 'approved',
+  type: 'boolean',
+} as const;
+
+const COMPANY_SEARCH_QUERY = `
+  query CompanySearch($query: String!) {
+    companies(first: 5, query: $query) {
+      nodes {
+        id
+        name
+        externalId
+      }
+    }
+  }
+`;
+
+const COMPANY_CREATE_MUTATION = `
+  mutation CompanyCreate($input: CompanyCreateInput!) {
+    companyCreate(input: $input) {
+      company {
+        id
+        name
+        locations(first: 1) {
+          nodes {
+            id
+          }
+        }
+      }
+      userErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
+const COMPANY_DELETE_MUTATION = `
+  mutation CompanyDelete($id: ID!) {
+    companyDelete(id: $id) {
+      deletedCompanyId
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const COMPANY_ASSIGN_CUSTOMER_MUTATION = `
+  mutation CompanyAssignCustomerAsContact($companyId: ID!, $customerId: ID!) {
+    companyAssignCustomerAsContact(
+      companyId: $companyId
+      customerId: $customerId
+    ) {
+      companyContact {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const METAFIELDS_SET_MUTATION = `
+  mutation MetafieldsSet($metafields: [MetafieldsSetInput!]!) {
+    metafieldsSet(metafields: $metafields) {
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * Whether a company already exists under this name.
+ *
+ * Shopify enforces no uniqueness on company names, so this is our own check.
+ * `companies(query:)` supports field-scoped search — `name:'Acme'` matches
+ * exactly, where bare free text is fuzzy and would produce false positives.
+ *
+ * Name only, deliberately. An earlier version also keyed on a slug of the name
+ * stored as `externalId`, which backfired: Shopify *does* enforce uniqueness on
+ * `externalId`, and **keeps it reserved after the company is deleted**. Since
+ * this flow deletes a half-built company on failure, every rolled-back attempt
+ * permanently burned that name — rejected as taken while appearing in no
+ * listing or search. So no externalId is set on companies at all now.
+ */
+async function findExistingCompany(
+  name: string,
+): Promise<{id: string; name: string} | null> {
+  const data = await adminFetch<{
+    companies: {nodes: Array<{id: string; name: string}>};
+  }>(
+    COMPANY_SEARCH_QUERY,
+    {query: `name:'${name.replace(/'/g, "\\'")}'`},
+    {noCache: true},
+  );
+
+  const hit = (data.companies?.nodes ?? []).find(
+    (node) => node.name?.toLowerCase() === name.toLowerCase(),
+  );
+
+  return hit ? {id: hit.id, name: hit.name} : null;
+}
+
+/** Removes a company. Used to roll back a half-built one. */
+async function deleteCompany(companyId: string): Promise<void> {
+  await adminFetch<{companyDelete: {deletedCompanyId: string | null}}>(
+    COMPANY_DELETE_MUTATION,
+    {id: companyId},
+    {mutation: true},
+  );
+}
+
+export type CreateCompanyInput = {
+  companyName: string;
+  location: CreateCompanyLocationInput & {name: string};
+};
+
+export type CreateCompanyResult =
+  | {ok: true; companyId: string; locationId: string; warning?: string}
+  | {ok: false; error: string};
+
+/**
+ * Creates a company with its first location and makes the given customer its
+ * Location admin.
+ *
+ * The order matters. A company whose creator holds no role is invisible to them
+ * — our account pages authorize against the customer's own contacts — and
+ * unlike a location it can't be repaired from the storefront. So if either
+ * assignment step fails the company is **deleted** and the original error
+ * returned: better nothing than an orphan.
+ *
+ * `defaultRole` on every company is `Ordering only`, so the admin role has to be
+ * assigned explicitly; relying on the default would leave the creator unable to
+ * administer what they just made.
+ */
+export async function createCompanyWithLocation(
+  customerId: string,
+  input: CreateCompanyInput,
+): Promise<CreateCompanyResult> {
+  const duplicate = await findExistingCompany(input.companyName);
+
+  if (duplicate) {
+    return {
+      ok: false,
+      error: `A company called "${duplicate.name}" already exists. If that's yours, ask someone there to add you instead.`,
+    };
+  }
+
+  const {name: locationName, ...locationRest} = input.location;
+
+  const created = await adminFetch<{
+    companyCreate: {
+      company: {id: string; locations: {nodes: Array<{id: string}>}} | null;
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_CREATE_MUTATION,
+    {
+      input: {
+        // No externalId: Shopify keeps it reserved after deletion, so deriving
+        // one from the name would burn the name on any rolled-back attempt.
+        company: {name: input.companyName},
+        companyLocation: {name: locationName, ...locationRest},
+      },
+    },
+    {mutation: true},
+  );
+
+  const payload = created.companyCreate;
+
+  if (payload?.userErrors?.length || !payload?.company) {
+    return {
+      ok: false,
+      error:
+        payload?.userErrors?.[0]?.message ?? 'Shopify rejected the company',
+    };
+  }
+
+  const companyId = payload.company.id;
+  const locationId = payload.company.locations?.nodes?.[0]?.id;
+
+  if (!locationId) {
+    await deleteCompany(companyId);
+    return {ok: false, error: 'The company was created without a location'};
+  }
+
+  // Attach the creator. `companyAssignCustomerAsContact` is the only way to
+  // link an *existing* customer — `companyCreate`'s own `companyContact` takes
+  // an email and would fail as TAKEN for anyone already registered.
+  const assigned = await adminFetch<{
+    companyAssignCustomerAsContact: {
+      companyContact: {id: string} | null;
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_ASSIGN_CUSTOMER_MUTATION,
+    {companyId, customerId},
+    {mutation: true},
+  );
+
+  const contactId =
+    assigned.companyAssignCustomerAsContact?.companyContact?.id ?? null;
+
+  if (!contactId) {
+    await deleteCompany(companyId);
+    return {
+      ok: false,
+      error:
+        assigned.companyAssignCustomerAsContact?.userErrors?.[0]?.message ??
+        'Could not add you to the company',
+    };
+  }
+
+  const roles = await getCompanyContactRoles(companyId);
+  const adminRole =
+    roles.find((role) => role.name === 'Location admin') ?? roles[0];
+
+  if (!adminRole) {
+    await deleteCompany(companyId);
+    return {ok: false, error: 'The company has no contact roles to assign'};
+  }
+
+  const roleAssigned = await changeCompanyContactRole(
+    contactId,
+    locationId,
+    null,
+    adminRole.id,
+  );
+
+  if (!roleAssigned.ok) {
+    await deleteCompany(companyId);
+    return {
+      ok: false,
+      error:
+        roleAssigned.userErrors[0]?.message ??
+        'Could not make you an admin of the company',
+    };
+  }
+
+  // Flagged unapproved for a human to review. Not rolled back on failure: an
+  // unflagged company is a one-click fix in the admin, whereas deleting a
+  // company someone just created is not.
+  const flagged = await adminFetch<{
+    metafieldsSet: {userErrors: Array<{field: string[] | null; message: string}>};
+  }>(
+    METAFIELDS_SET_MUTATION,
+    {
+      metafields: [
+        {
+          ownerId: companyId,
+          namespace: APPROVAL_METAFIELD.namespace,
+          key: APPROVAL_METAFIELD.key,
+          type: APPROVAL_METAFIELD.type,
+          value: 'false',
+        },
+      ],
+    },
+    {mutation: true},
+  );
+
+  const flagErrors = flagged.metafieldsSet?.userErrors ?? [];
+
+  return {
+    ok: true,
+    companyId,
+    locationId,
+    ...(flagErrors.length
+      ? {
+          warning: `Company created, but it could not be flagged for review: ${flagErrors[0].message}`,
+        }
+      : {}),
+  };
+}
