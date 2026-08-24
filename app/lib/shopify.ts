@@ -1086,3 +1086,177 @@ export async function changeCompanyContactRole(
 
   return {ok: true};
 }
+
+
+/* ------------------------------------------------------------------ *
+ * Company contacts — creation
+ * ------------------------------------------------------------------ */
+
+const COMPANY_CONTACT_CREATE_MUTATION = `
+  mutation CompanyContactCreate($companyId: ID!, $input: CompanyContactInput!) {
+    companyContactCreate(companyId: $companyId, input: $input) {
+      companyContact {
+        id
+        customer {
+          id
+          email
+        }
+      }
+      userErrors {
+        field
+        message
+        code
+      }
+    }
+  }
+`;
+
+export type CreateCompanyContactInput = {
+  email: string;
+  firstName?: string;
+  lastName?: string;
+  title?: string;
+  phone?: string;
+};
+
+const COMPANY_CONTACT_SEND_WELCOME_EMAIL_MUTATION = `
+  mutation CompanyContactSendWelcomeEmail($companyContactId: ID!) {
+    companyContactSendWelcomeEmail(companyContactId: $companyContactId) {
+      companyContact {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * Sends a company contact the B2B welcome email — the same message the admin
+ * sends from a customer's "send B2B access email".
+ *
+ * **Currently unusable from this app, and not called.** Every API version from
+ * 2025-07 to unstable returns ACCESS_DENIED:
+ *
+ *   "Required access: `write_customers` access scope or `write_companies`
+ *    access scope. Also: The shop must have access to B2B. Some operations may
+ *    require additional plan capabilities."
+ *
+ * The stated requirements are all met — this token holds both `write_customers`
+ * and `write_companies`, and in the same request cycle `companyContactCreate`
+ * (which documents the same requirement) is authorized and returns a normal
+ * userError. So the gate is the last clause, a plan capability this app can't
+ * hold, not scopes.
+ *
+ * Kept because it's correct and ready if that ever changes. Until then the
+ * welcome email is sent from the Shopify admin, and the UI says so.
+ */
+export async function sendCompanyContactWelcomeEmail(
+  companyContactId: string,
+): Promise<AssignCompanyAddressResult> {
+  const data = await adminFetch<{
+    companyContactSendWelcomeEmail: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_CONTACT_SEND_WELCOME_EMAIL_MUTATION,
+    {companyContactId},
+    {mutation: true},
+  );
+
+  const userErrors =
+    data.companyContactSendWelcomeEmail?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
+
+  return {ok: true};
+}
+
+export type CreateCompanyContactResult =
+  | {ok: true; contactId: string}
+  | {
+      ok: false;
+      userErrors: Array<{
+        field: string[] | null;
+        message: string;
+        code?: string | null;
+      }>;
+    };
+
+/**
+ * Adds a new customer to the company as a contact, then gives them a role at
+ * one location.
+ *
+ * Shopify enforces email uniqueness here, so there's no pre-check: an address
+ * that already belongs to a customer comes back as
+ * `{code: 'TAKEN', message: 'Email address has already been taken.'}` with
+ * nothing created — the same behaviour as the admin's own dialog, which is what
+ * we want. A customer can only belong to one company.
+ *
+ * **No email is sent.** `companyContactSendWelcomeEmail` is the right mutation
+ * but is ACCESS_DENIED for this app (see its docblock), so the notification is
+ * sent from the Shopify admin instead.
+ *
+ * That's a courtesy, not a grant: this shop runs `NEW_CUSTOMER_ACCOUNTS`
+ * (verified), so sign-in is a one-time code and the contact can order the
+ * moment creation succeeds, email or no email.
+ */
+export async function createCompanyContact(
+  companyId: string,
+  locationId: string,
+  input: CreateCompanyContactInput,
+  companyContactRoleId: string,
+): Promise<CreateCompanyContactResult> {
+  const company = companyId.startsWith('gid://')
+    ? companyId
+    : `gid://shopify/Company/${companyId}`;
+
+  const data = await adminFetch<{
+    companyContactCreate: {
+      companyContact: {id: string} | null;
+      userErrors: Array<{
+        field: string[] | null;
+        message: string;
+        code?: string | null;
+      }>;
+    };
+  }>(
+    COMPANY_CONTACT_CREATE_MUTATION,
+    {companyId: company, input},
+    {mutation: true},
+  );
+
+  const payload = data.companyContactCreate;
+
+  if (payload?.userErrors?.length || !payload?.companyContact) {
+    return {ok: false, userErrors: payload?.userErrors ?? []};
+  }
+
+  const contactId = payload.companyContact.id;
+
+  // The contact exists company-wide at this point but belongs to no location,
+  // so it wouldn't appear on any location page. Reported rather than swallowed
+  // if this second step fails, since the contact is already created.
+  const assigned = await changeCompanyContactRole(
+    contactId,
+    locationId,
+    null,
+    companyContactRoleId,
+  );
+
+  if (!assigned.ok) {
+    return {
+      ok: false,
+      userErrors: [
+        {
+          field: null,
+          message: `Customer created, but assigning them to this location failed: ${assigned.userErrors[0]?.message ?? 'unknown error'}`,
+        },
+      ],
+    };
+  }
+
+  return {ok: true, contactId};
+}

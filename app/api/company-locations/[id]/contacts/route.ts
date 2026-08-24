@@ -1,5 +1,9 @@
 import {withCors, optionsResponse} from '../../../_lib/cors';
-import {changeCompanyContactRole, revokeCompanyContactRole} from '~/lib/shopify';
+import {
+  changeCompanyContactRole,
+  createCompanyContact,
+  revokeCompanyContactRole,
+} from '~/lib/shopify';
 
 export function OPTIONS() {
   return optionsResponse();
@@ -24,17 +28,57 @@ export async function POST(
   try {
     const {id} = await params;
     const body = (await req.json()) as {
-      action?: 'change-role' | 'remove';
+      action?: 'change-role' | 'remove' | 'create';
+      companyId?: string;
+      email?: string;
+      firstName?: string;
+      lastName?: string;
       companyContactId?: string;
       roleAssignmentId?: string | null;
       companyContactRoleId?: string;
     };
 
+    let result;
+
+    if (body.action === 'create') {
+      if (!body.companyId || !body.email || !body.companyContactRoleId) {
+        return withCors(
+          {error: 'A company id, email and role are required'},
+          400,
+        );
+      }
+
+      const created = await createCompanyContact(
+        body.companyId,
+        id,
+        {
+          email: body.email,
+          ...(body.firstName ? {firstName: body.firstName} : {}),
+          ...(body.lastName ? {lastName: body.lastName} : {}),
+        },
+        body.companyContactRoleId,
+      );
+
+      if (!created.ok) {
+        const first = created.userErrors[0];
+        return withCors(
+          {
+            error: first?.message ?? 'Shopify rejected the customer',
+            // Surfaced so the form can tell "this email is taken" apart from a
+            // generic failure, without matching on message text.
+            code: first?.code ?? null,
+            userErrors: created.userErrors,
+          },
+          422,
+        );
+      }
+
+      return withCors({ok: true});
+    }
+
     if (!body.companyContactId) {
       return withCors({error: 'A company contact id is required'}, 400);
     }
-
-    let result;
 
     if (body.action === 'remove') {
       if (!body.roleAssignmentId) {
