@@ -27,17 +27,6 @@ export type ProductVariant = {
   selectedOptions: Array<{name: string; value: string}>;
 };
 
-export type BackendPage = {
-  id: string;
-  title: string;
-  handle: string;
-  body: string;
-  seo: {
-    title: string | null;
-    description: string | null;
-  };
-};
-
 export type BackendCollection = {
   id: string;
   title: string;

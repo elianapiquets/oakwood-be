@@ -1,4 +1,4 @@
-import type {BackendCollection, BackendPage, BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
+import type {BackendCollection, BackendProduct, ChemistryInfo, ProductVariant} from '~/api/_data/types';
 
 const PRODUCT_FIELDS = `
   id
@@ -209,72 +209,6 @@ const COLLECTIONS_QUERY = `
   }
 `;
 
-const COLLECTION_BY_HANDLE_QUERY = `
-  query CollectionByHandle($handle: String!) {
-    collectionByHandle(handle: $handle) {
-      id
-      title
-      handle
-      description
-      image {
-        url
-        altText
-        width
-        height
-      }
-      products(first: 250) {
-        nodes { ${PRODUCT_FIELDS} }
-      }
-    }
-  }
-`;
-
-export type BackendCollectionDetail = BackendCollection & {
-  description: string | null;
-  products: BackendProduct[];
-};
-
-export async function getCollectionByHandle(
-  handle: string,
-): Promise<BackendCollectionDetail | null> {
-  const data = await adminFetch<{
-    collectionByHandle: {
-      id: string;
-      title: string;
-      handle: string;
-      description: string | null;
-      image: BackendCollection['image'];
-      products: {nodes: Parameters<typeof mapProduct>[0][]};
-    } | null;
-  }>(COLLECTION_BY_HANDLE_QUERY, {handle});
-
-  const raw = data.collectionByHandle;
-  if (!raw) return null;
-
-  return {
-    id: raw.id,
-    title: raw.title,
-    handle: raw.handle,
-    description: raw.description,
-    image: raw.image,
-    products: raw.products.nodes.map(mapProduct),
-  };
-}
-
-export async function getPageByHandle(handle: string): Promise<BackendPage | null> {
-  const data = await adminFetch<{
-    pages: {nodes: BackendPage[]};
-  }>(`
-    query PageByHandle($query: String!) {
-      pages(first: 1, query: $query) {
-        nodes { id title handle body seo { title description } }
-      }
-    }
-  `, {query: `handle:${handle}`});
-
-  return data.pages.nodes[0] ?? null;
-}
-
 type CollectionsPage = {
   collections: {
     pageInfo: {hasNextPage: boolean; endCursor: string | null};
@@ -331,17 +265,6 @@ export async function getProductByHandle(
   return data.productByHandle ? mapProduct(data.productByHandle) : null;
 }
 
-export async function getProductBySku(
-  sku: string,
-): Promise<BackendProduct | null> {
-  const all = await getAllProducts();
-  return (
-    all.find((p) =>
-      p.variants.some((v) => v.sku.toLowerCase() === sku.toLowerCase()),
-    ) ?? null
-  );
-}
-
 const SEARCH_PRODUCTS_QUERY = `
   query SearchProducts($query: String!, $first: Int!) {
     products(first: $first, query: $query) {
@@ -358,24 +281,6 @@ export async function searchProducts(
     products: {nodes: Parameters<typeof mapProduct>[0][]};
   }>(SEARCH_PRODUCTS_QUERY, {query, first: limit});
   return data.products.nodes.map(mapProduct);
-}
-
-export async function getProductsByHandles(
-  handles: string[],
-): Promise<BackendProduct[]> {
-  const results = await Promise.all(
-    handles.map((h) => getProductByHandle(h).catch(() => null)),
-  );
-  return results.filter((p): p is BackendProduct => p !== null);
-}
-
-export type BackendCompany = {id: string; name: string};
-
-export async function getAllCompanies(): Promise<BackendCompany[]> {
-  const data = await adminFetch<{
-    companies: {nodes: BackendCompany[]};
-  }>(`{ companies(first: 50) { nodes { id name } } }`);
-  return data.companies.nodes;
 }
 
 /**
@@ -745,7 +650,6 @@ export async function createCompanyLocation(
   return {ok: true, location: payload.companyLocation};
 }
 
-
 /* ------------------------------------------------------------------ *
  * Company locations — address assignment
  * ------------------------------------------------------------------ */
@@ -814,7 +718,6 @@ export async function assignCompanyLocationAddress(
 
   return {ok: true};
 }
-
 
 /* ------------------------------------------------------------------ *
  * Company locations — tax settings
@@ -885,7 +788,6 @@ export async function updateCompanyLocationTaxSettings(
 
   return {ok: true};
 }
-
 
 /* ------------------------------------------------------------------ *
  * Company locations — payment terms
@@ -965,7 +867,6 @@ export async function updateCompanyLocationPaymentTerms(
 
   return {ok: true};
 }
-
 
 /* ------------------------------------------------------------------ *
  * Company contacts — roles at a location
@@ -1086,7 +987,6 @@ export async function changeCompanyContactRole(
 
   return {ok: true};
 }
-
 
 /* ------------------------------------------------------------------ *
  * Company contacts — creation
