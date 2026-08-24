@@ -965,3 +965,124 @@ export async function updateCompanyLocationPaymentTerms(
 
   return {ok: true};
 }
+
+
+/* ------------------------------------------------------------------ *
+ * Company contacts — roles at a location
+ * ------------------------------------------------------------------ */
+
+export type CompanyContactRoleOption = {id: string; name: string};
+
+/**
+ * The company's contact roles.
+ *
+ * Has to come from the Admin API: the Customer Account API has no
+ * `Company.contactRoles` (validated against live 2026-04), so the storefront
+ * can't read the role gids the assign mutation needs.
+ */
+export async function getCompanyContactRoles(
+  companyId: string,
+): Promise<CompanyContactRoleOption[]> {
+  const id = companyId.startsWith('gid://')
+    ? companyId
+    : `gid://shopify/Company/${companyId}`;
+
+  const data = await adminFetch<{
+    company: {contactRoles: {nodes: CompanyContactRoleOption[]}} | null;
+  }>(COMPANY_CONTACT_ROLES_QUERY, {companyId: id});
+
+  return data.company?.contactRoles?.nodes ?? [];
+}
+
+const COMPANY_CONTACT_REVOKE_ROLE_MUTATION = `
+  mutation CompanyContactRevokeRole(
+    $companyContactId: ID!
+    $companyContactRoleAssignmentId: ID!
+  ) {
+    companyContactRevokeRole(
+      companyContactId: $companyContactId
+      companyContactRoleAssignmentId: $companyContactRoleAssignmentId
+    ) {
+      revokedCompanyContactRoleAssignmentId
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+/**
+ * Removes a contact from one location by revoking their role assignment there.
+ *
+ * Deliberately *not* `companyContactRemoveFromCompany` or
+ * `companyContactDelete`: those detach the contact from the company entirely,
+ * including its other locations. Revoking one assignment is the narrow action
+ * this UI offers.
+ */
+export async function revokeCompanyContactRole(
+  companyContactId: string,
+  roleAssignmentId: string,
+): Promise<AssignCompanyAddressResult> {
+  const data = await adminFetch<{
+    companyContactRevokeRole: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_CONTACT_REVOKE_ROLE_MUTATION,
+    {companyContactId, companyContactRoleAssignmentId: roleAssignmentId},
+    {mutation: true},
+  );
+
+  const userErrors = data.companyContactRevokeRole?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
+
+  return {ok: true};
+}
+
+/**
+ * Changes a contact's role at one location.
+ *
+ * Revokes the existing assignment before assigning the new one. Assigning alone
+ * isn't obviously idempotent — it could leave the contact holding two roles at
+ * the same location — and two conflicting roles would be worse than a failed
+ * change, so the old one goes first.
+ *
+ * If the revoke succeeds and the assign fails, the contact is left with no role
+ * at this location. That's reported, not swallowed, so it can be retried.
+ */
+export async function changeCompanyContactRole(
+  companyContactId: string,
+  companyLocationId: string,
+  roleAssignmentId: string | null,
+  companyContactRoleId: string,
+): Promise<AssignCompanyAddressResult> {
+  const locationId = companyLocationId.startsWith('gid://')
+    ? companyLocationId
+    : `gid://shopify/CompanyLocation/${companyLocationId}`;
+
+  if (roleAssignmentId) {
+    const revoked = await revokeCompanyContactRole(
+      companyContactId,
+      roleAssignmentId,
+    );
+    if (!revoked.ok) return revoked;
+  }
+
+  const data = await adminFetch<{
+    companyContactAssignRole: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    COMPANY_CONTACT_ASSIGN_ROLE_MUTATION,
+    {companyContactId, companyContactRoleId, companyLocationId: locationId},
+    {mutation: true},
+  );
+
+  const userErrors = data.companyContactAssignRole?.userErrors ?? [];
+
+  if (userErrors.length) return {ok: false, userErrors};
+
+  return {ok: true};
+}
