@@ -17,7 +17,13 @@ export async function GET(
       return withCors({error: `No company location found for id: ${id}`}, 404);
     }
 
-    return withCors(billing);
+    // `checkout` is deliberately not exposed. It exists so the payment-terms
+    // write can preserve the sibling flags in `buyerExperienceConfiguration`,
+    // which happens inside the backend — it never needs to cross the wire, and
+    // a field nobody consumes is a field that can be wrong unnoticed.
+    const {checkout: _internalOnly, ...response} = billing;
+
+    return withCors(response);
   } catch (err) {
     return withCors(
       {

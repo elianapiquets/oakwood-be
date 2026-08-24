@@ -271,8 +271,9 @@ export type CompanyLocationBilling = {
     taxExempt: boolean | null;
   };
   /**
-   * The rest of `buyerExperienceConfiguration`. Returned so a payment-terms
-   * update can send it back unchanged — see `updateCompanyLocationPaymentTerms`.
+   * The rest of `buyerExperienceConfiguration`, for internal use only — the
+   * payment-terms write sends it back unchanged so changing terms doesn't reset
+   * the checkout settings. The HTTP route strips it before responding.
    */
   checkout: {
     checkoutToDraft: boolean | null;
