@@ -612,70 +612,10 @@ export async function createCompanyLocation(
  * Company locations — address assignment
  * ------------------------------------------------------------------ */
 
-export type CompanyAddressType = 'BILLING' | 'SHIPPING';
-
-const COMPANY_LOCATION_ASSIGN_ADDRESS_MUTATION = `
-  mutation CompanyLocationAssignAddress(
-    $locationId: ID!
-    $address: CompanyAddressInput!
-    $addressTypes: [CompanyAddressType!]!
-  ) {
-    companyLocationAssignAddress(
-      locationId: $locationId
-      address: $address
-      addressTypes: $addressTypes
-    ) {
-      addresses {
-        id
-      }
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-
-export type AssignCompanyAddressResult =
+/** The shape every B2B write returns: ok, or Shopify's userErrors. */
+export type MutationResult =
   | {ok: true}
   | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
-
-/**
- * Sets a location's shipping and/or billing address.
- *
- * This is the only way to change one: `CompanyLocationUpdateInput` has no
- * address fields at all (verified by introspection at 2025-07), so
- * `companyLocationUpdate` can't do it. Passing both types is how "same as
- * shipping" is expressed after creation.
- *
- * `locationId` accepts either the numeric id or a full gid.
- */
-export async function assignCompanyLocationAddress(
-  locationId: string,
-  address: CompanyAddressInput,
-  addressTypes: CompanyAddressType[],
-): Promise<AssignCompanyAddressResult> {
-  const id = locationId.startsWith('gid://')
-    ? locationId
-    : `gid://shopify/CompanyLocation/${locationId}`;
-
-  const data = await adminFetch<{
-    companyLocationAssignAddress: {
-      userErrors: Array<{field: string[] | null; message: string}>;
-    };
-  }>(
-    COMPANY_LOCATION_ASSIGN_ADDRESS_MUTATION,
-    {locationId: id, address, addressTypes},
-    {mutation: true},
-  );
-
-  const userErrors =
-    data.companyLocationAssignAddress?.userErrors ?? [];
-
-  if (userErrors.length) return {ok: false, userErrors};
-
-  return {ok: true};
-}
 
 /* ------------------------------------------------------------------ *
  * Company locations — tax settings
@@ -791,7 +731,7 @@ export async function updateCompanyLocationPaymentTerms(
     checkoutToDraft?: boolean | null;
     editableShippingAddress?: boolean | null;
   },
-): Promise<AssignCompanyAddressResult> {
+): Promise<MutationResult> {
   const id = locationId.startsWith('gid://')
     ? locationId
     : `gid://shopify/CompanyLocation/${locationId}`;
@@ -882,7 +822,7 @@ const COMPANY_CONTACT_REVOKE_ROLE_MUTATION = `
 export async function revokeCompanyContactRole(
   companyContactId: string,
   roleAssignmentId: string,
-): Promise<AssignCompanyAddressResult> {
+): Promise<MutationResult> {
   const data = await adminFetch<{
     companyContactRevokeRole: {
       userErrors: Array<{field: string[] | null; message: string}>;
@@ -916,7 +856,7 @@ export async function changeCompanyContactRole(
   companyLocationId: string,
   roleAssignmentId: string | null,
   companyContactRoleId: string,
-): Promise<AssignCompanyAddressResult> {
+): Promise<MutationResult> {
   const locationId = companyLocationId.startsWith('gid://')
     ? companyLocationId
     : `gid://shopify/CompanyLocation/${companyLocationId}`;
@@ -1013,7 +953,7 @@ const COMPANY_CONTACT_SEND_WELCOME_EMAIL_MUTATION = `
  */
 export async function sendCompanyContactWelcomeEmail(
   companyContactId: string,
-): Promise<AssignCompanyAddressResult> {
+): Promise<MutationResult> {
   const data = await adminFetch<{
     companyContactSendWelcomeEmail: {
       userErrors: Array<{field: string[] | null; message: string}>;
