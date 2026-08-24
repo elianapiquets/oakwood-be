@@ -1124,6 +1124,22 @@ export async function createCompanyContact(
  * ------------------------------------------------------------------ */
 
 /**
+ * Customers allowed to administer the company itself — rename it, add or remove
+ * locations.
+ *
+ * Shopify has no company-level role: every role assignment is bound to a
+ * location (`CompanyContactRoleAssignment.companyLocation` is non-null), and
+ * `Company.mainContact` isn't exposed to the Customer Account API and allows
+ * only one person. A `list.customer_reference` metafield carries the list, whose
+ * value is a JSON array of customer gids.
+ */
+export const COMPANY_ADMIN_METAFIELD = {
+  namespace: 'custom',
+  key: 'company_admin',
+  type: 'list.customer_reference',
+} as const;
+
+/**
  * Our own approval flag — Shopify has no native pending state for companies.
  *
  * A **boolean**, backed by a metafield definition created in the admin: the
@@ -1381,9 +1397,9 @@ export async function createCompanyWithLocation(
     };
   }
 
-  // Flagged unapproved for a human to review. Not rolled back on failure: an
-  // unflagged company is a one-click fix in the admin, whereas deleting a
-  // company someone just created is not.
+  // Flagged unapproved for review, and the creator recorded as company admin.
+  // Not rolled back on failure: both are one-click fixes in the admin, whereas
+  // deleting a company someone just created is not.
   const flagged = await adminFetch<{
     metafieldsSet: {userErrors: Array<{field: string[] | null; message: string}>};
   }>(
@@ -1396,6 +1412,16 @@ export async function createCompanyWithLocation(
           key: APPROVAL_METAFIELD.key,
           type: APPROVAL_METAFIELD.type,
           value: 'false',
+        },
+        // The creator administers what they just made. Without this the company
+        // admin list is empty, and the gate fails closed — leaving nobody able
+        // to add a second location to their own company.
+        {
+          ownerId: companyId,
+          namespace: COMPANY_ADMIN_METAFIELD.namespace,
+          key: COMPANY_ADMIN_METAFIELD.key,
+          type: COMPANY_ADMIN_METAFIELD.type,
+          value: JSON.stringify([customerId]),
         },
       ],
     },
