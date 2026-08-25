@@ -17,13 +17,22 @@ export async function GET(
       return withCors({error: `No company location found for id: ${id}`}, 404);
     }
 
-    // `checkout` is deliberately not exposed. It exists so the payment-terms
-    // write can preserve the sibling flags in `buyerExperienceConfiguration`,
-    // which happens inside the backend — it never needs to cross the wire, and
-    // a field nobody consumes is a field that can be wrong unnoticed.
-    const {checkout: _internalOnly, ...response} = billing;
+    // `checkout` stays internal apart from one field. It exists so the
+    // payment-terms write can preserve the sibling flags in
+    // `buyerExperienceConfiguration` without a round trip, and a field nobody
+    // consumes is a field that can be wrong unnoticed.
+    //
+    // `editableShippingAddress` now has a consumer: the storefront's quote page
+    // gates "Use a different address" on it, and the Customer Account API has
+    // no equivalent — its `BuyerExperienceConfiguration` exposes only `deposit`,
+    // `payNowOnly` and `paymentTermsTemplate`. `checkoutToDraft` still has no
+    // reader, so it is still withheld.
+    const {checkout, ...rest} = billing;
 
-    return withCors(response);
+    return withCors({
+      ...rest,
+      checkout: {editableShippingAddress: checkout?.editableShippingAddress ?? null},
+    });
   } catch (err) {
     return withCors(
       {

@@ -1382,3 +1382,148 @@ export async function createCompanyWithLocation(
       : {}),
   };
 }
+
+/* ------------------------------------------------------------------ *
+ * Draft orders — quote requests
+ * ------------------------------------------------------------------ */
+
+const DRAFT_ORDER_CREATE_MUTATION = `
+  mutation DraftOrderCreate($input: DraftOrderInput!) {
+    draftOrderCreate(input: $input) {
+      draftOrder {
+        id
+        name
+        status
+        invoiceUrl
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+export type CreateDraftOrderInput = {
+  lines: Array<{variantId: string; quantity: number}>;
+  email?: string;
+  companyId: string;
+  companyContactId: string;
+  companyLocationId: string;
+  /** `MailingAddressInput` fields. Blank values are dropped before sending. */
+  shippingAddress?: Record<string, string | null | undefined>;
+  /** Recorded, never priced — review sets the real rate. */
+  requestedShippingMethod?: string;
+  note?: string;
+};
+
+export type CreateDraftOrderResult =
+  | {
+      ok: true;
+      draftOrder: {
+        id: string;
+        name: string;
+        status: string;
+        invoiceUrl: string | null;
+      };
+    }
+  | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
+
+/**
+ * Creates a B2B draft order — Shopify's model for a quote awaiting review.
+ *
+ * Only the Admin API can do this. The Storefront API has no draft order concept
+ * at all, and the Customer Account API *reads* them (`customer.draftOrders`,
+ * `companyLocation.draftOrders`) but exposes no mutation to create one —
+ * verified by introspecting its schema, which has 40 mutations and none for
+ * draft orders. Hence this endpoint.
+ *
+ * Two fields carry the whole B2B behaviour:
+ *
+ * - `purchasingEntity.purchasingCompany` files the draft under the company and
+ *   location rather than a lone customer, which is what makes it appear in
+ *   `companyLocation.draftOrders` and price against the company's catalogue.
+ * - `visibleToCustomer: true` is what lets the buyer read it back at all.
+ *   Without it the draft exists and the customer can never see it.
+ *
+ * No `shippingLine` is set: the requested method is the buyer's *request*, and
+ * hazmat handling and freight are worked out by a human during review. It is
+ * recorded as a note and a line-item attribute so whoever prices the quote can
+ * see what was asked for.
+ */
+export async function createDraftOrder(
+  input: CreateDraftOrderInput,
+): Promise<CreateDraftOrderResult> {
+  // Shopify parses some address fields rather than storing them verbatim —
+  // `phone: ''` comes back as an invalid number — so blanks are omitted rather
+  // than sent empty, matching what the admin itself does.
+  const shippingAddress = input.shippingAddress
+    ? Object.fromEntries(
+        Object.entries(input.shippingAddress).filter(
+          ([, value]) => typeof value === 'string' && value.trim() !== '',
+        ),
+      )
+    : undefined;
+
+  const data = await adminFetch<{
+    draftOrderCreate: {
+      draftOrder: {
+        id: string;
+        name: string;
+        status: string;
+        invoiceUrl: string | null;
+      } | null;
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    DRAFT_ORDER_CREATE_MUTATION,
+    {
+      input: {
+        lineItems: input.lines.map((line) => ({
+          variantId: line.variantId,
+          quantity: line.quantity,
+        })),
+        ...(input.email ? {email: input.email} : {}),
+        ...(shippingAddress && Object.keys(shippingAddress).length
+          ? {shippingAddress}
+          : {}),
+        purchasingEntity: {
+          purchasingCompany: {
+            companyId: input.companyId,
+            companyContactId: input.companyContactId,
+            companyLocationId: input.companyLocationId,
+          },
+        },
+        visibleToCustomer: true,
+        ...(input.note ? {note: input.note} : {}),
+        ...(input.requestedShippingMethod
+          ? {
+              customAttributes: [
+                {
+                  key: 'Requested shipping',
+                  value: input.requestedShippingMethod,
+                },
+              ],
+            }
+          : {}),
+        // So a quote is distinguishable from a draft an admin started by hand.
+        tags: ['quote-request', 'storefront'],
+      },
+    },
+    {mutation: true},
+  );
+
+  const userErrors = data.draftOrderCreate?.userErrors ?? [];
+  const draftOrder = data.draftOrderCreate?.draftOrder;
+
+  if (userErrors.length || !draftOrder) {
+    return {
+      ok: false,
+      userErrors: userErrors.length
+        ? userErrors
+        : [{field: null, message: 'Shopify returned no draft order'}],
+    };
+  }
+
+  return {ok: true, draftOrder};
+}
