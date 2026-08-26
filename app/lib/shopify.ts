@@ -1414,6 +1414,8 @@ export type CreateDraftOrderInput = {
   shippingAddress?: Record<string, string | null | undefined>;
   /** Recorded, never priced — review sets the real rate. */
   requestedShippingMethod?: string;
+  /** Codes the buyer had applied to the cart, re-applied to the draft. */
+  discountCodes?: string[];
   note?: string;
 };
 
@@ -1496,6 +1498,12 @@ export async function createDraftOrder(
         },
         visibleToCustomer: true,
         ...(input.note ? {note: input.note} : {}),
+        // Carried over from the cart so the quote is priced the way the buyer
+        // saw it. Without this the draft silently loses the discount and the
+        // reviewer prices from list.
+        ...(input.discountCodes?.length
+          ? {discountCodes: input.discountCodes}
+          : {}),
         ...(input.requestedShippingMethod
           ? {
               customAttributes: [
