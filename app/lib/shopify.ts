@@ -1610,3 +1610,119 @@ export async function fetchDraftOrderLines(
     variantId: line.variant?.id ?? null,
   }));
 }
+
+const ORDER_DELIVERY_ESTIMATE_QUERY = `#graphql
+  query OrderDeliveryEstimate($id: ID!) {
+    shop {
+      ianaTimezone
+    }
+    order(id: $id) {
+      id
+      fulfillmentOrders(first: 10) {
+        nodes {
+          status
+          deliveryMethod {
+            methodType
+            presentedName
+            minDeliveryDateTime
+            maxDeliveryDateTime
+          }
+        }
+      }
+    }
+  }
+`;
+
+export type OrderDeliveryEstimate = {
+  /** Earliest promised arrival, `YYYY-MM-DD` in the shop's own timezone. */
+  min: string | null;
+  /** Latest promised arrival — the "Expected by" date. */
+  max: string | null;
+  /** The shipping method as the buyer chose it, e.g. "Standard". */
+  methodName: string | null;
+};
+
+/**
+ * Plain calendar date in a given timezone.
+ *
+ * **Not a substring of the ISO string.** Shopify returns the promise as an
+ * instant — `maxDeliveryDateTime: 2026-09-05T03:59:59Z` — which is 23:59:59 on
+ * September *4th* in `America/New_York`, the shop's timezone. Slicing the ISO
+ * text would report the 5th and be a day late on every order in the Americas.
+ */
+function calendarDate(iso: string | null | undefined, timeZone: string): string | null {
+  if (!iso) return null;
+
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return null;
+
+  // en-CA gives YYYY-MM-DD.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(at);
+}
+
+/**
+ * When an order is promised to arrive.
+ *
+ * Lives here because **no storefront API exposes it.** The Customer Account API
+ * has no delivery estimate at all: `Fulfillment.estimatedDeliveryAt` is null on
+ * this shop, `Order.latestFulfillmentDeliveryDate` is in the published schema
+ * but rejected by the live API, and `ShippingLine` carries only a title and a
+ * price. The promise lives on the *fulfillment order's* delivery method, which
+ * is Admin-only — and reading it needs the fulfillment-order scopes.
+ *
+ * Works on unfulfilled orders too, which is the point: a buyer wants the date
+ * most before anything has shipped.
+ *
+ * When an order is split across locations there is a fulfillment order each, so
+ * the latest promise wins — that is the date by which the whole order has
+ * arrived, which is what "Expected by" claims.
+ */
+export async function fetchOrderDeliveryEstimate(
+  orderId: string,
+): Promise<OrderDeliveryEstimate | null> {
+  const data = await adminFetch<{
+    shop: {ianaTimezone: string} | null;
+    order: {
+      id: string;
+      fulfillmentOrders: {
+        nodes: Array<{
+          status: string | null;
+          deliveryMethod: {
+            methodType: string | null;
+            presentedName: string | null;
+            minDeliveryDateTime: string | null;
+            maxDeliveryDateTime: string | null;
+          } | null;
+        }>;
+      };
+    } | null;
+  }>(ORDER_DELIVERY_ESTIMATE_QUERY, {id: orderId});
+
+  if (!data.order) return null;
+
+  const timeZone = data.shop?.ianaTimezone ?? 'UTC';
+
+  const methods = data.order.fulfillmentOrders.nodes
+    .map((node) => node.deliveryMethod)
+    .filter((method): method is NonNullable<typeof method> => Boolean(method));
+
+  if (!methods.length) return null;
+
+  const latest = methods.reduce((furthest, method) =>
+    (method.maxDeliveryDateTime ?? '') > (furthest.maxDeliveryDateTime ?? '')
+      ? method
+      : furthest,
+  );
+
+  const min = calendarDate(latest.minDeliveryDateTime, timeZone);
+  const max = calendarDate(latest.maxDeliveryDateTime, timeZone);
+
+  if (!min && !max) return null;
+
+  return {min, max, methodName: latest.presentedName ?? null};
+}
