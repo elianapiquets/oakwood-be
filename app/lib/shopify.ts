@@ -1535,3 +1535,78 @@ export async function createDraftOrder(
 
   return {ok: true, draftOrder};
 }
+
+const DRAFT_ORDER_LINES_QUERY = `#graphql
+  query DraftOrderLines($id: ID!) {
+    draftOrder(id: $id) {
+      id
+      lineItems(first: 100) {
+        nodes {
+          id
+          name
+          sku
+          quantity
+          variant {
+            id
+          }
+        }
+      }
+    }
+  }
+`;
+
+export type DraftOrderLine = {
+  id: string;
+  name: string | null;
+  sku: string | null;
+  quantity: number;
+  /**
+   * `null` for a custom line item — a draft order can carry lines typed in by
+   * hand that were never a catalogue variant. Those can't be re-ordered, so the
+   * line is still returned and the storefront renders it as unavailable rather
+   * than quietly shortening the list.
+   */
+  variantId: string | null;
+};
+
+/**
+ * The line items of one draft order, with the variant ids the storefront needs
+ * to rebuild a cart from a quote.
+ *
+ * This exists because the **Customer Account API cannot answer it.** Its
+ * `DraftOrderLineItem` type has no `variant`, no `product` and no `merchandise`
+ * field at all — only `sku` — and the Storefront API can't look a variant up by
+ * sku either (`products(query:)` filters on title/vendor/tag/type/price, not
+ * sku). The Admin API is the only place the mapping exists.
+ *
+ * `noCache` because a quote's lines change while it is being negotiated, and a
+ * stale line here becomes a wrong cart.
+ */
+export async function fetchDraftOrderLines(
+  draftOrderId: string,
+): Promise<DraftOrderLine[] | null> {
+  const data = await adminFetch<{
+    draftOrder: {
+      id: string;
+      lineItems: {
+        nodes: Array<{
+          id: string;
+          name: string | null;
+          sku: string | null;
+          quantity: number;
+          variant: {id: string} | null;
+        }>;
+      };
+    } | null;
+  }>(DRAFT_ORDER_LINES_QUERY, {id: draftOrderId}, {noCache: true});
+
+  if (!data.draftOrder) return null;
+
+  return data.draftOrder.lineItems.nodes.map((line) => ({
+    id: line.id,
+    name: line.name,
+    sku: line.sku,
+    quantity: line.quantity,
+    variantId: line.variant?.id ?? null,
+  }));
+}
