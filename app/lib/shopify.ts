@@ -1726,3 +1726,322 @@ export async function fetchOrderDeliveryEstimate(
 
   return {min, max, methodName: latest.presentedName ?? null};
 }
+
+/**
+ * A saved cart — a named basket a buyer parked to reorder later.
+ *
+ * Stored as a `saved_cart` metaobject, with the *authoritative* line list in the
+ * `lines` JSON field. The `product_variant` reference list is populated too, but
+ * only so the entry is browsable in admin: a variant reference list can't carry
+ * quantities, and pairing it with a parallel array breaks silently the moment
+ * Shopify drops a deleted variant and every quantity shifts by one.
+ */
+export type SavedCartLine = {
+  variantId: string;
+  quantity: number;
+};
+
+export type SavedCart = {
+  id: string;
+  name: string;
+  savedAt: string | null;
+  note: string | null;
+  lines: SavedCartLine[];
+};
+
+const SAVED_CART_TYPE = 'saved_cart';
+const SAVED_CARTS_NAMESPACE = 'custom';
+const SAVED_CARTS_KEY = 'saved_carts';
+
+const SAVED_CARTS_QUERY = `#graphql
+  query SavedCarts($customerId: ID!) {
+    customer(id: $customerId) {
+      metafield(namespace: "custom", key: "saved_carts") {
+        references(first: 50) {
+          nodes {
+            ... on Metaobject {
+              id
+              updatedAt
+              fields {
+                key
+                value
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/** Metaobject fields arrive as a flat key/value list. */
+function readField(
+  fields: Array<{key: string; value: string | null}>,
+  key: string,
+): string | null {
+  return fields.find((field) => field.key === key)?.value ?? null;
+}
+
+function parseLines(value: string | null): SavedCartLine[] {
+  if (!value) return [];
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(
+        (line): line is SavedCartLine =>
+          Boolean(line) &&
+          typeof (line as SavedCartLine).variantId === 'string' &&
+          Number.isFinite((line as SavedCartLine).quantity),
+      )
+      .map((line) => ({
+        variantId: line.variantId,
+        quantity: Math.max(1, Math.trunc(line.quantity)),
+      }));
+  } catch {
+    // The field is JSON by definition, but a hand-edited entry in admin is
+    // possible — an unreadable cart is better empty than a 500.
+    return [];
+  }
+}
+
+/**
+ * A customer's saved carts, newest first.
+ *
+ * Read through the customer's `custom.saved_carts` index rather than by querying
+ * metaobjects, because **metaobject field filtering does not work**: verified on
+ * Admin 2025-07, 2026-07 and 2026-10, `metaobjects(query: "customer:gid://…")`
+ * matches every record regardless of owner, and `fields.customer:` matches none.
+ * The `adminFilterable` capability drives the admin UI's filter, not the
+ * GraphQL `query` argument. Reading the index instead makes ownership
+ * structural — this returns exactly the ids the customer owns.
+ */
+export async function listSavedCarts(customerId: string): Promise<SavedCart[]> {
+  const data = await adminFetch<{
+    customer: {
+      metafield: {
+        references: {
+          nodes: Array<{
+            id: string;
+            updatedAt: string | null;
+            fields: Array<{key: string; value: string | null}>;
+          }>;
+        } | null;
+      } | null;
+    } | null;
+  }>(SAVED_CARTS_QUERY, {customerId}, {noCache: true});
+
+  const nodes = data.customer?.metafield?.references?.nodes ?? [];
+
+  return nodes
+    .filter((node) => node?.id)
+    .map((node) => ({
+      id: node.id,
+      name: readField(node.fields, 'name') ?? 'Saved cart',
+      savedAt: readField(node.fields, 'saved_at') ?? node.updatedAt,
+      note: readField(node.fields, 'note'),
+      lines: parseLines(readField(node.fields, 'lines')),
+    }))
+    .sort((a, b) => (a.savedAt ?? '') < (b.savedAt ?? '') ? 1 : -1);
+}
+
+/** The index metafield's current contents, as metaobject ids. */
+async function readIndex(customerId: string): Promise<string[]> {
+  const data = await adminFetch<{
+    customer: {metafield: {value: string | null} | null} | null;
+  }>(
+    `#graphql
+      query SavedCartIndex($customerId: ID!) {
+        customer(id: $customerId) {
+          metafield(namespace: "custom", key: "saved_carts") {
+            value
+          }
+        }
+      }
+    `,
+    {customerId},
+    {noCache: true},
+  );
+
+  const raw = data.customer?.metafield?.value;
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeIndex(customerId: string, ids: string[]): Promise<string | null> {
+  const data = await adminFetch<{
+    metafieldsSet: {
+      userErrors: Array<{field: string[] | null; message: string}>;
+    };
+  }>(
+    `#graphql
+      mutation SetSavedCartIndex($metafields: [MetafieldsSetInput!]!) {
+        metafieldsSet(metafields: $metafields) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      metafields: [
+        {
+          ownerId: customerId,
+          namespace: SAVED_CARTS_NAMESPACE,
+          key: SAVED_CARTS_KEY,
+          type: 'list.metaobject_reference',
+          value: JSON.stringify(ids),
+        },
+      ],
+    },
+    {mutation: true},
+  );
+
+  const errors = data.metafieldsSet?.userErrors ?? [];
+  return errors.length ? errors.map((e) => e.message).join(', ') : null;
+}
+
+export type SaveCartInput = {
+  customerId: string;
+  name: string;
+  lines: SavedCartLine[];
+  note?: string;
+};
+
+export type SavedCartResult =
+  | {ok: true; savedCart: {id: string; name: string}}
+  | {ok: false; error: string};
+
+/**
+ * Creates a saved cart and adds it to the customer's index.
+ *
+ * **Create then index, in that order.** A failure between the two leaves an
+ * orphan metaobject the customer never sees, which is harmless and cleanable;
+ * indexing first would leave a reference to something that doesn't exist.
+ */
+export async function createSavedCart(
+  input: SaveCartInput,
+): Promise<SavedCartResult> {
+  const {customerId, name, lines, note} = input;
+
+  if (!lines.length) {
+    return {ok: false, error: 'A saved cart needs at least one item'};
+  }
+
+  const baseFields = [
+    {key: 'name', value: name},
+    {key: 'customer', value: customerId},
+    {key: 'lines', value: JSON.stringify(lines)},
+    {key: 'saved_at', value: new Date().toISOString()},
+    ...(note ? [{key: 'note', value: note}] : []),
+  ];
+
+  const create = (fields: Array<{key: string; value: string}>) =>
+    adminFetch<{
+      metaobjectCreate: {
+        metaobject: {id: string} | null;
+        userErrors: Array<{field: string[] | null; message: string; code: string | null}>;
+      };
+    }>(
+      `#graphql
+        mutation CreateSavedCart($metaobject: MetaobjectCreateInput!) {
+          metaobjectCreate(metaobject: $metaobject) {
+            metaobject {
+              id
+            }
+            userErrors {
+              field
+              message
+              code
+            }
+          }
+        }
+      `,
+      {metaobject: {type: SAVED_CART_TYPE, fields}},
+      {mutation: true},
+    );
+
+  // `product_variant` is admin browsability only, never read back as data — but
+  // it is a reference list, so Shopify *validates* it and a variant deleted
+  // between filling the cart and saving would fail the whole save over a
+  // decorative field. Drop it and retry rather than lose the buyer's cart.
+  let data = await create([
+    ...baseFields,
+    {key: 'product_variant', value: JSON.stringify(lines.map((line) => line.variantId))},
+  ]);
+
+  if (
+    (data.metaobjectCreate?.userErrors ?? []).some((error) =>
+      /non-existent resource/i.test(error.message),
+    )
+  ) {
+    data = await create(baseFields);
+  }
+
+  const userErrors = data.metaobjectCreate?.userErrors ?? [];
+  const created = data.metaobjectCreate?.metaobject;
+
+  if (!created || userErrors.length) {
+    return {
+      ok: false,
+      error: userErrors.map((e) => e.message).join(', ') || 'Shopify returned no saved cart',
+    };
+  }
+
+  const indexError = await writeIndex(customerId, [
+    created.id,
+    ...(await readIndex(customerId)).filter((id) => id !== created.id),
+  ]);
+
+  if (indexError) {
+    // The metaobject exists but isn't indexed, so it is invisible. Say so rather
+    // than reporting a success the customer won't be able to see.
+    return {ok: false, error: `Saved, but not listed: ${indexError}`};
+  }
+
+  return {ok: true, savedCart: {id: created.id, name}};
+}
+
+/**
+ * Removes a saved cart.
+ *
+ * **De-index first.** If the delete then fails, the cart is merely hidden and
+ * can be reclaimed; deleting first would leave the index pointing at nothing.
+ */
+export async function deleteSavedCart(
+  customerId: string,
+  savedCartId: string,
+): Promise<SavedCartResult | {ok: true}> {
+  const remaining = (await readIndex(customerId)).filter(
+    (id) => id !== savedCartId,
+  );
+
+  const indexError = await writeIndex(customerId, remaining);
+  if (indexError) return {ok: false, error: indexError};
+
+  await adminFetch<{metaobjectDelete: {deletedId: string | null}}>(
+    `#graphql
+      mutation DeleteSavedCart($id: ID!) {
+        metaobjectDelete(id: $id) {
+          deletedId
+          userErrors {
+            message
+          }
+        }
+      }
+    `,
+    {id: savedCartId},
+    {mutation: true},
+  );
+
+  return {ok: true};
+}
