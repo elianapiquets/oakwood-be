@@ -1387,6 +1387,34 @@ export async function createCompanyWithLocation(
  * Draft orders — quote requests
  * ------------------------------------------------------------------ */
 
+/**
+ * How long a quote holds the stock it was quoted against.
+ *
+ * Without a reservation a draft order holds **nothing**: two quotes can promise
+ * the same last 25g, and the second customer to accept gets a stockout after
+ * being told a price. Verified on the POC store — an open $4,718 quote for
+ * 2 × 25g moved the inventory pool not at all until this field was set.
+ *
+ * Two days is short on purpose. The hold starts the moment the quote is
+ * created, before the customer has agreed to anything, so a long window means
+ * abandoned quotes sitting on material that is physically on the shelf. If
+ * Oakwood honours quotes for longer than this, the number to change is here —
+ * but so is the cost.
+ */
+const QUOTE_INVENTORY_RESERVATION_DAYS = 2;
+
+/**
+ * Shopify wants an absolute timestamp, not a duration, so the window is
+ * resolved at request time.
+ */
+function quoteReservationExpiry(): string {
+  const expiry = new Date(
+    Date.now() + QUOTE_INVENTORY_RESERVATION_DAYS * 24 * 60 * 60 * 1000,
+  );
+
+  return expiry.toISOString();
+}
+
 const DRAFT_ORDER_CREATE_MUTATION = `
   mutation DraftOrderCreate($input: DraftOrderInput!) {
     draftOrderCreate(input: $input) {
@@ -1395,6 +1423,7 @@ const DRAFT_ORDER_CREATE_MUTATION = `
         name
         status
         invoiceUrl
+        reserveInventoryUntil
       }
       userErrors {
         field
@@ -1427,6 +1456,11 @@ export type CreateDraftOrderResult =
         name: string;
         status: string;
         invoiceUrl: string | null;
+        /**
+         * When the stock hold on this quote lapses. Returned so the storefront
+         * can tell the buyer how long the price and the material are held for.
+         */
+        reserveInventoryUntil: string | null;
       };
     }
   | {ok: false; userErrors: Array<{field: string[] | null; message: string}>};
@@ -1474,6 +1508,7 @@ export async function createDraftOrder(
         name: string;
         status: string;
         invoiceUrl: string | null;
+        reserveInventoryUntil: string | null;
       } | null;
       userErrors: Array<{field: string[] | null; message: string}>;
     };
@@ -1514,6 +1549,11 @@ export async function createDraftOrder(
               ],
             }
           : {}),
+        // Holds the quoted stock so a second buyer can't be sold the same
+        // material while this quote is open. On products modelled as bundles
+        // the hold lands on the shared component pool, so every pack size
+        // shrinks together — confirmed against 093855 on the POC store.
+        reserveInventoryUntil: quoteReservationExpiry(),
         // So a quote is distinguishable from a draft an admin started by hand.
         tags: ['quote-request', 'storefront'],
       },
