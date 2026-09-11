@@ -1434,7 +1434,17 @@ const DRAFT_ORDER_CREATE_MUTATION = `
 `;
 
 export type CreateDraftOrderInput = {
-  lines: Array<{variantId: string; quantity: number}>;
+  lines: Array<{
+    variantId: string;
+    quantity: number;
+    /**
+     * Carried from the cart line. The storefront uses this for the Sage stock
+     * split ("17 ship now · 1 backordered") so a quote records what was
+     * available when it was asked for — the pool moves on, so it cannot be
+     * recomputed later.
+     */
+    customAttributes?: Array<{key: string; value: string}>;
+  }>;
   email?: string;
   companyId: string;
   companyContactId: string;
@@ -1519,6 +1529,9 @@ export async function createDraftOrder(
         lineItems: input.lines.map((line) => ({
           variantId: line.variantId,
           quantity: line.quantity,
+          ...(line.customAttributes?.length
+            ? {customAttributes: line.customAttributes}
+            : {}),
         })),
         ...(input.email ? {email: input.email} : {}),
         ...(shippingAddress && Object.keys(shippingAddress).length
