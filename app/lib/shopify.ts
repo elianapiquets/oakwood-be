@@ -1555,6 +1555,10 @@ const DRAFT_ORDER_LINES_QUERY = `#graphql
       id
       lineItems(first: 100) {
         nodes {
+          customAttributes {
+            key
+            value
+          }
           id
           name
           sku
@@ -1580,6 +1584,13 @@ export type DraftOrderLine = {
    * than quietly shortening the list.
    */
   variantId: string | null;
+  /**
+   * Whatever the storefront wrote onto the line when the quote was created —
+   * today, the Sage stock split under the key `Availability`. Same reason as
+   * `variantId`: the Customer Account API exposes none of this on a draft order
+   * line, so the storefront has to read it back through here.
+   */
+  customAttributes: Array<{key: string; value: string}>;
 };
 
 /**
@@ -1608,6 +1619,7 @@ export async function fetchDraftOrderLines(
           sku: string | null;
           quantity: number;
           variant: {id: string} | null;
+          customAttributes: Array<{key: string; value: string}>;
         }>;
       };
     } | null;
@@ -1621,6 +1633,10 @@ export async function fetchDraftOrderLines(
     sku: line.sku,
     quantity: line.quantity,
     variantId: line.variant?.id ?? null,
+    // Carried for the same reason as the variant: the Customer Account API
+    // exposes no custom attributes on a draft order line, so the storefront
+    // cannot read back what it wrote when the quote was created.
+    customAttributes: line.customAttributes ?? [],
   }));
 }
 
